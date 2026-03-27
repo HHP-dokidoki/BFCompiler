@@ -78,7 +78,7 @@ int main()
 
     ccode_file.close();
 
-    system("gcc temp.c -o -O2 res.exe\n");
+    system("gcc temp.c -o res.exe\n");
     system("pause");
     return 0;
 }
@@ -227,7 +227,7 @@ std::optional<std::vector<Instruction> > Compile(std::vector<Character>& raw_cod
 void Generate_CCode(std::ofstream& target_file, std::vector<Instruction>& Inst_list)
 {
     target_file << "#include <stdio.h>\n";
-    target_file << "unsigned char array[3000000] = {0};\n";
+    target_file << "unsigned char array[3000] = {0};\n";
     target_file << "char* ptc = array;\n";
     target_file << "int main()\n{\n";
     for (auto cmd : Inst_list) {

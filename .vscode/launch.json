@@ -10,14 +10,12 @@
             "request": "launch",
             "program": "${fileDirname}/${fileBasenameNoExtension}.exe", //"enter program name, for example ${workspaceFolder}/a.exe"
             "args": [],
-            // "program": "C:\\Windows\\system32\\cmd.exe",
-            // "args": ["/C","${fileDirname}\\${fileBasenameNoExtension}.exe","&","pause"],
             "stopAtEntry": false,
             "cwd": "${fileDirname}",
             "environment": [],
             "externalConsole": true,
             "MIMode": "gdb",
-            "miDebuggerPath": "D:/MinGW/w64devkit-2.5.0/bin/gdb.exe", //"/path/to/gdb",
+            "miDebuggerPath": "D:/Msys2/ucrt64/bin/gdb.exe", //"/path/to/gdb",
             "setupCommands": [
                 {
                     "description": "Enable pretty-printing for gdb",

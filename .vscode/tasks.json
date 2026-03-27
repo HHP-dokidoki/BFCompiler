@@ -3,7 +3,7 @@
         {
             "type": "cppbuild",
             "label": "C/C++: g++.exe build active file",
-            "command": "D:/MinGW/w64devkit-2.5.0/bin/g++.exe",
+            "command": "D:/Msys2/ucrt64/bin/g++.exe",
             "args": [
                 "-fdiagnostics-color=always",
                 "-g",
@@ -14,7 +14,7 @@
                 "-fexec-charset=utf-8",
                 "-Wall",
                 "-Wextra",
-                // "-O2",
+                "-O2",
             ],
             "options": {
                 "cwd": "${fileDirname}"
