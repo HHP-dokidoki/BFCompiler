@@ -41,13 +41,13 @@ std::optional<std::vector<Character> >      PreProcess(std::ifstream& file);
 
 
 
-// int main(int argc, char* argv[]) 
-int main() 
+int main(int argc, char* argv[]) 
+// int main() 
 {
 
-    // (void)argc;
+    (void)argc;
 
-    std::string   input_file_name = "./Example/6.bf";
+    std::string   input_file_name = argv[1];
     std::ofstream ccode_file("temp.c", std::ios::out);
     std::ifstream input_file;
 
@@ -78,7 +78,7 @@ int main()
 
     ccode_file.close();
 
-    system("gcc temp.c -o -O2 res.exe\n");
+    system("gcc temp.c -o res.exe -O2 \n");
     system("pause");
     return 0;
 }
