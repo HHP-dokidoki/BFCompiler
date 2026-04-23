@@ -1,0 +1,88 @@
+#include "Optimizer.h"
+
+
+
+
+std::vector<Instruction> Optimizer::buildAST(const std::vector<OPT>& instructions, size_t& index)
+{
+    std::vector<Instruction> block;
+
+    while (index < instructions.size()) {
+
+        const auto& inst = instructions[index++];
+
+        if (inst.type == Tp::LOP_E) {
+            break;
+        }
+
+        Instruction node;
+        node.type   = inst.type;
+        node.value  = inst.value;
+        node.offset = 0;
+
+        if (inst.type == Tp::LOP_S) {
+            node.sub_inst = buildAST(instructions, index);
+        }
+
+        block.push_back(std::move(node));
+    }   
+    return block;
+}
+
+std::vector<Instruction> Optimizer::canonicalization(const std::vector<Instruction>& block)
+{
+    std::vector<Instruction> optimized;
+    std::unordered_map<long long, long long> mem_state;
+
+    long long deltaP = 0;
+
+    for (const auto& inst : block) {
+
+        if (inst.type == Tp::MOV_P) {
+            deltaP += inst.value;
+        } else if (inst.type == Tp::ADD_V) {
+            mem_state[deltaP] += inst.value;
+        } else {
+
+            flush_memory_state(mem_state, optimized);
+
+            if (inst.type == Tp::LOP_S) {
+                if (deltaP != 0) {
+                    optimized.push_back((Instruction){Tp::MOV_P, 0, deltaP, {}});
+                }
+                Instruction sub_block;
+                sub_block.type     = inst.type;
+                sub_block.value    = inst.value;
+                sub_block.offset   = inst.offset;
+                sub_block.sub_inst = canonicalization(inst.sub_inst);
+                optimized.push_back(std::move(sub_block));
+            } else {
+                Instruction temp;
+                temp.type   = inst.type;
+                temp.offset = deltaP;
+                temp.value  = inst.value;
+                optimized.push_back(std::move(temp));
+            }
+        }
+    }
+
+    flush_memory_state(mem_state, optimized);
+    if (deltaP != 0) {
+        optimized.push_back((Instruction){Tp::MOV_P, 0, deltaP, {}});
+    }
+    return optimized;
+}
+
+bool Optimizer::optimize(std::vector<OPT>& instructions)
+{
+    size_t index = 0;
+    std::vector<Instruction> ast = buildAST(instructions, index);
+    std::vector<Instruction> optimized_ast = canonicalization(ast);
+
+    instructions.clear();
+    
+    //
+    // ???
+
+    return true;
+}

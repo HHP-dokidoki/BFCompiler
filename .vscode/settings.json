@@ -98,5 +98,6 @@
         "valarray": "cpp",
         "variant": "cpp",
         "[nwerc 2023]-lateraldamagep13711,cpp": "cpp"
-    }
+    },
+    "CodeGPT.apiKey": "Google AI Studio"
 }

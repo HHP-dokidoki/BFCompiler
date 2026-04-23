@@ -7,14 +7,14 @@
             "args": [
                 "-fdiagnostics-color=always",
                 "-g",
-                "${file}",
+                "${workspaceFolder}/src/*.cpp",
                 "-o",
-                "${fileDirname}/${fileBasenameNoExtension}.exe",
+                "${workspaceFolder}/BFCompiler.exe",
                 "-std=c++23",
                 "-fexec-charset=utf-8",
                 "-Wall",
                 "-Wextra",
-                "-O2",
+                "-O0",
             ],
             "options": {
                 "cwd": "${fileDirname}"
