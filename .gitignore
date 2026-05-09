@@ -1,1 +1,5 @@
 *.exe
+Temp/*
+*.py
+.vscode/*
+bf-compiler/*
