@@ -2,21 +2,21 @@
 #include "Common.h"
 
 class Simplifier {
-    private:
-        std::vector<Character> raw_code;
-        std::ifstream       fstream;
-        
-        inline Tp cToInst(char c);
-        
-        bool readCode(std::string file_name);
+private:
+    std::vector<Character> raw_code;
+    std::ifstream       file_stream;
+    
+    inline Tp charToInstruction(char char_);
+    
+    bool readCodeFromFile(std::string file_path);
 
-        bool preprocess(); 
+    bool preprocess(); 
 
-    public:
-        std::vector<OPT>    simpl_inst;
-        
-        Simplifier() = default;
+public:
+    std::vector<Operation> simpl_inst;
+    
+    Simplifier() = default;
 
-        bool simplify(std::string file_path);
+    bool simplify(std::string file_path);
 
 };

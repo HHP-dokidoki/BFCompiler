@@ -4,6 +4,7 @@
 class CodeGenerator {
 private:
     std::ofstream out_file;
+    std::vector<char> io_buffer;
 
 public:
     CodeGenerator() {}

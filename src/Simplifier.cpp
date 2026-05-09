@@ -1,107 +1,138 @@
 #include "Simplifier.h"
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
-
-inline Tp Simplifier::cToInst(char c) {
-    return  (c == '+' || c == '-') ? Tp::ADD_V : 
-    (c == '<' || c == '>') ? Tp::MOV_P : 
-    (c == '[') ? Tp::LOP_S : 
-    (c == ']') ? Tp::LOP_E : 
-    (c == ',') ? Tp::IN : 
-    Tp::OUT;
+inline Tp Simplifier::charToInstruction(char instruction_char) {
+    switch (instruction_char) {
+        case '+': case '-': return Tp::ADD_V;
+        case '<': case '>': return Tp::MOV_P;
+        case '[':           return Tp::LOP_S;
+        case ']':           return Tp::LOP_E;
+        case ',':           return Tp::IN;
+        case '.':           return Tp::OUT;
+        default:
+            std::cerr << "Internal error: invalid character '" << instruction_char 
+                      << "' in charToInstruction" << std::endl;
+            throw std::runtime_error("Invalid instruction character");
+    }
 }
 
 bool Simplifier::simplify(std::string file_path)
 {
-
-    bool state = readCode(file_path);
-    if (!state) {
-        // Log
+    // 1. Read and filter Brainfuck code from the file.
+    if (!readCodeFromFile(file_path)) {
         return false;
     }
-    state = preprocess();
-    if (!state) { 
-        // Log
+    // 2. Group identical consecutive instructions.
+    if (!preprocess()) { 
         return false;
     }
     return true;
 }
 
-bool Simplifier::readCode(std::string file_dir)
+bool Simplifier::readCodeFromFile(std::string file_path)
 {
-    fstream.open(file_dir);
-    if (!fstream.is_open()) {
-        // Log 
-        return 0;
-    }
-
-
-    char c;
-    size_t line = 1, col = 0;
-    while (fstream.good()) {
-        c = fstream.get();
-        if (c == EOF) {
-            break;
-        }
-        col ++;
-        if (c == '.') {
-            printf("Read '.' at line %zu, column %zu\n", line, col);
-        } else if (c == ',') {
-            printf("Read ',' at line %zu, column %zu\n", line, col);
-        }
-        switch (c) {
-            case '\n' :
-                line ++;
-                col = 0;
-                break;
-            case ' ' :
-            case '\r':
-                // Do nothing
-                break;
-            case '\t':
-                // Do nothing
-                break;
-            case '#' :
-                // Skip this line
-                line ++;
-                col = 0;
-                fstream.ignore(std::numeric_limits<std::streamsize>::max());
-                break;
-            default :
-                if (c == '+' || c == '-' || c == '<' || c == '>' || 
-                    c == '.' || c == ',' || c == '[' || c == ']') {
-                        raw_code.push_back((Character){c, line, col});
-                } else {
-                    // Log error
-                    return 0;
-                }
-        }
-    }
-
-    if (!fstream.eof()) {
-        // Log
+    std::ifstream file_stream(file_path, std::ios::binary);
+    if (!file_stream.is_open()) {
+        std::cerr << "Could not open file: " << file_path << std::endl;
         return false;
     }
+
+    file_stream.seekg(0, std::ios::end);
+    const std::streamoff file_size = file_stream.tellg();
+    if (file_size < 0) {
+        std::cerr << "Could not read file size: " << file_path << std::endl;
+        return false;
+    }
+    file_stream.seekg(0, std::ios::beg);
+
+    std::string data(static_cast<size_t>(file_size), '\0');
+    if (file_size > 0) {
+        file_stream.read(data.data(), file_size);
+        if (!file_stream) {
+            std::cerr << "Could not read file: " << file_path << std::endl;
+            return false;
+        }
+    }
+
+    raw_code.clear();
+    raw_code.reserve(data.size());
+
+    size_t line_number = 1;
+    size_t column_number = 0;
+    int bracket_counter = 0;
+    for (size_t i = 0; i < data.size(); ++i) {
+        const char current_char = data[i];
+        column_number++;
+
+        switch (current_char) {
+            case '\n':
+                line_number++;
+                column_number = 0;
+                break;
+            case ' ':
+            case '\r':
+            case '\t':
+                // Ignore whitespace.
+                break;
+            case '#': {
+                // Ignore comments (lines starting with #).
+                while (i + 1 < data.size() && data[i + 1] != '\n') {
+                    ++i;
+                }
+                line_number++;
+                column_number = 0;
+                break;
+            }
+            default:
+                // Process potential Brainfuck characters.
+                if (std::string("+-<>[].,").find(current_char) != std::string::npos) {
+                    if (current_char == '[') {
+                        bracket_counter++;
+                    } else if (current_char == ']') {
+                        bracket_counter--;
+                        if (bracket_counter < 0) {
+                            std::cerr << "Syntax Error: Unmatched ']' at line " << line_number << ", col " << column_number << std::endl;
+                            return false;
+                        }
+                    }
+                    raw_code.push_back({current_char, line_number, column_number});
+                }
+                break;
+        }
+    }
+
+    if (bracket_counter > 0) {
+        std::cerr << "Syntax Error: Unclosed '['. " << bracket_counter << " missing ']'." << std::endl;
+        return false;
+    }
+
     return true;
 }
 
 bool Simplifier::preprocess()
 {   
     for (auto it = raw_code.begin(); it != raw_code.end(); ++it) {
-        int cnt = 1;
-        int coef = 1;
-        if (it->c == '+' || it->c == '>') {
-            coef = 1;
-        } else if (it->c == '-' || it->c == '<') {
-            coef = -1;
+        long long count = 1;
+        int coefficient = 1;
+        
+        if (it->c == '-' || it->c == '<') {
+            coefficient = -1;
         }
         
-        Tp inst = cToInst(it->c);
+        Tp instruction_type = charToInstruction(it->c);
 
-        while (it + 1 != raw_code.end() && (it + 1)->c == it->c && inst != Tp::LOP_S && inst != Tp::LOP_E) {
-            cnt++;
-            ++it;
+        // Group consecutive identical instructions (e.g., +++, ---, <<<), but not loops.
+        if (instruction_type != Tp::LOP_S && instruction_type != Tp::LOP_E) {
+            while (it + 1 != raw_code.end() && (it + 1)->c == it->c) {
+                count++;
+                ++it;
+            }
         }
-        simpl_inst.push_back((OPT){inst, coef * cnt});
+        simpl_inst.push_back({instruction_type, coefficient * count});
     }
     return true;
 }

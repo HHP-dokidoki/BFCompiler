@@ -9,12 +9,12 @@
                 "-g",
                 "${workspaceFolder}/src/*.cpp",
                 "-o",
-                "${workspaceFolder}/BFCompiler.exe",
+                "${workspaceFolder}/bf-compiler.exe",
                 "-std=c++23",
                 "-fexec-charset=utf-8",
                 "-Wall",
                 "-Wextra",
-                "-O0",
+                "-O3",
             ],
             "options": {
                 "cwd": "${fileDirname}"

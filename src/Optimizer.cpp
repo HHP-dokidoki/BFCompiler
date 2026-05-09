@@ -1,14 +1,67 @@
 #include "Optimizer.h"
+#include "MathSolver.h"
 
+#include <algorithm>
+#include <unordered_set>
+#include <functional>
 
+namespace {
+constexpr long long kTapeMod = 256;
 
+// Normalize value to [0, mod-1]
+long long modNorm(long long value, long long mod) {
+    long long result = value % mod;
+    return (result < 0) ? (result + mod) : result;
+}
 
-std::vector<Instruction> Optimizer::buildAST(const std::vector<OPT>& instructions, size_t& index)
+// Convert value to unsigned char (0-255)
+unsigned char toByte(long long value) {
+    return static_cast<unsigned char>(modNorm(value, kTapeMod));
+}
+
+bool blockEqual(const std::vector<Instruction>& lhs, const std::vector<Instruction>& rhs);
+
+bool instructionEqual(const Instruction& lhs, const Instruction& rhs) {
+    if (lhs.type != rhs.type || lhs.offset != rhs.offset || lhs.value != rhs.value) {
+        return false;
+    }
+    return blockEqual(lhs.sub_inst, rhs.sub_inst);
+}
+
+bool blockEqual(const std::vector<Instruction>& lhs, const std::vector<Instruction>& rhs) {
+    if (lhs.size() != rhs.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < lhs.size(); ++i) {
+        if (!instructionEqual(lhs[i], rhs[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Sort memory pairs by offset for deterministic code generation
+std::vector<std::pair<long long, long long>> sortedNonZeroPairs(const std::unordered_map<long long, long long>& values) {
+    std::vector<std::pair<long long, long long>> pairs;
+    pairs.reserve(values.size());
+    for (const auto& [offset, value] : values) {
+        if (toByte(value) != 0) {
+            pairs.push_back({offset, value});
+        }
+    }
+    std::sort(pairs.begin(), pairs.end(), [](const auto& a, const auto& b) {
+        return a.first < b.first;
+    });
+    return pairs;
+}
+}
+
+// Build Abstract Syntax Tree from flat instructions
+std::vector<Instruction> Optimizer::buildAst(const std::vector<Operation>& instructions, size_t& index)
 {
     std::vector<Instruction> block;
 
     while (index < instructions.size()) {
-
         const auto& inst = instructions[index++];
 
         if (inst.type == Tp::LOP_E) {
@@ -16,269 +69,753 @@ std::vector<Instruction> Optimizer::buildAST(const std::vector<OPT>& instruction
         }
 
         Instruction node;
-        node.type   = inst.type;
-        node.value  = inst.value;
+        node.type = inst.type;
+        node.value = inst.value;
         node.offset = 0;
 
         if (inst.type == Tp::LOP_S) {
-            node.sub_inst = buildAST(instructions, index);
+            node.sub_inst = buildAst(instructions, index);
         }
 
         block.push_back(std::move(node));
-    }   
+    }
+
     return block;
 }
 
-inline void Optimizer::flush_memory_state(std::unordered_map<long long, long long>&mem_state, std::vector<Instruction>& optimized)
+
+// Flush accumulated memory changes to instruction list
+inline void Optimizer::flushMemoryState(std::unordered_map<long long, long long>& mem_state, std::vector<Instruction>& optimized)
 {
-    for (const auto& [offset, val] : mem_state) {
-        if (val != 0) {
-            optimized.push_back(Instruction{Tp::ADD_V, offset, val, {}});
-        }
+    const auto pairs = sortedNonZeroPairs(mem_state);
+    for (const auto& [offset, value] : pairs) {
+        optimized.push_back(Instruction{Tp::ADD_V, offset, value, {}});
     }
     mem_state.clear();
 }
 
-std::vector<Instruction> Optimizer::canonicalization(const std::vector<Instruction>& block)
+// Canonicalization: combine adjacent MOV_P and ADD_V, shift offsets
+std::vector<Instruction> Optimizer::canonicalization(const std::vector<Instruction>& block, bool& changed)
 {
     std::vector<Instruction> optimized;
     std::unordered_map<long long, long long> mem_state;
+    long long delta_p = 0;
 
-    long long deltaP = 0;
+    auto flushPointer = [&](long long& delta_p_ref, std::vector<Instruction>& optimized_ref) {
+        if (delta_p_ref != 0) {
+            optimized_ref.push_back(Instruction{Tp::MOV_P, 0, delta_p_ref, {}});
+            delta_p_ref = 0;
+        }
+    };
 
     for (const auto& inst : block) {
-
         if (inst.type == Tp::MOV_P) {
-            deltaP += inst.value;
-
-        } else if (inst.type == Tp::ADD_V) {
-            mem_state[deltaP] += inst.value;
-
-        } else {
-
-            flush_memory_state(mem_state, optimized);
-
-            if (inst.type == Tp::LOP_S) {
-                if (deltaP != 0) {
-                    optimized.push_back((Instruction){Tp::MOV_P, 0, deltaP, {}});
-                    deltaP = 0;
-                }
-
-                Instruction sub_block;
-                sub_block.type     = inst.type;
-                sub_block.value    = inst.value;
-                sub_block.offset   = inst.offset;
-                sub_block.sub_inst = canonicalization(inst.sub_inst);
-
-                optimized.push_back(std::move(sub_block));
-            } else if (inst.type == Tp::OUT || inst.type == Tp::IN){
-                if (inst.type == Tp::IN) {
-                    printf("Optimizing IN instruction at offset %lld with value %lld\n", deltaP + inst.offset, inst.value);
-                } else {
-                    printf("Optimizing OUT instruction at offset %lld with value %lld\n", deltaP + inst.offset, inst.value);
-                }
-                Instruction temp;
-                temp.type   = inst.type;
-                temp.offset = deltaP;
-                temp.value  = inst.value;
-                optimized.push_back(std::move(temp));
-            }
+            delta_p += inst.value;
+            continue;
         }
+
+        if (inst.type == Tp::ADD_V) {
+            mem_state[delta_p + inst.offset] += inst.value;
+            continue;
+        }
+
+        // IN, OUT, SET_V can be shifted by delta_p, but must flush pending ADD_V first
+        if (inst.type == Tp::IN || inst.type == Tp::OUT || inst.type == Tp::SET_V) {
+            flushMemoryState(mem_state, optimized);
+            Instruction shifted = inst;
+            shifted.offset += delta_p;
+            optimized.push_back(std::move(shifted));
+            continue;
+        }
+
+        // Instructions that depend on pointer being at a specific location
+        flushMemoryState(mem_state, optimized);
+        flushPointer(delta_p, optimized);
+
+        if (inst.type == Tp::MAC || inst.type == Tp::SCAN || inst.type == Tp::MATH_MAC ||
+            inst.type == Tp::LOP_S || inst.type == Tp::IF_S) {
+            Instruction node = inst;
+            if (inst.type == Tp::LOP_S || inst.type == Tp::IF_S) {
+                node.sub_inst = canonicalization(inst.sub_inst, changed);
+            }
+            optimized.push_back(std::move(node));
+            continue;
+        }
+
+        optimized.push_back(inst);
     }
 
-    flush_memory_state(mem_state, optimized);
-    if (deltaP != 0) {
-        optimized.push_back((Instruction){Tp::MOV_P, 0, deltaP, {}});
-        deltaP = 0;
+    flushMemoryState(mem_state, optimized);
+    flushPointer(delta_p, optimized);
+
+    // Clean up no-ops
+    std::vector<Instruction> compact;
+    compact.reserve(optimized.size());
+    for (const auto& inst : optimized) {
+        if ((inst.type == Tp::ADD_V || inst.type == Tp::MOV_P) && inst.value == 0) {
+            changed = true;
+            continue;
+        }
+        if (inst.type == Tp::IF_S && inst.sub_inst.empty()) {
+            changed = true;
+            continue;
+        }
+        compact.push_back(inst);
     }
+
+    if (!blockEqual(compact, block)) {
+        changed = true;
+    }
+
+    return compact;
+}
+
+// Semantic Lifting: Detect common patterns like [-], [->+<], etc.
+std::vector<Instruction> Optimizer::semanticLifting(const std::vector<Instruction>& block, bool& changed)
+{
+    std::vector<Instruction> optimized;
+    optimized.reserve(block.size());
+
+    for (const auto& inst : block) {
+        if (inst.type == Tp::LOP_S) {
+            Instruction loop_node = inst;
+            loop_node.sub_inst = semanticLifting(inst.sub_inst, changed);
+
+            // Check if loop body only contains pointer moves and value additions
+            bool simple_loop = true;
+            for (const auto& sub_inst : loop_node.sub_inst) {
+                if (sub_inst.type != Tp::ADD_V && sub_inst.type != Tp::MOV_P) {
+                    simple_loop = false;
+                    break;
+                }
+            }
+
+            if (!simple_loop) {
+                optimized.push_back(std::move(loop_node));
+                continue;
+            }
+
+            long long delta_p = 0;
+            std::unordered_map<long long, long long> mem_state;
+            for (const auto& sub_inst : loop_node.sub_inst) {
+                if (sub_inst.type == Tp::MOV_P) {
+                    delta_p += sub_inst.value;
+                } else if (sub_inst.type == Tp::ADD_V) {
+                    mem_state[delta_p + sub_inst.offset] += sub_inst.value;
+                }
+            }
+
+            // Remove zero changes
+            for (auto it = mem_state.begin(); it != mem_state.end();) {
+                if (toByte(it->second) == 0) {
+                    it = mem_state.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
+            if (delta_p == 0) {
+                const auto it_zero = mem_state.find(0);
+
+                // Pattern: [-] or [+]
+                if (mem_state.size() == 1 && it_zero != mem_state.end() && std::abs(it_zero->second) == 1) {
+                    optimized.push_back(Instruction{Tp::SET_V, 0, 0, {}});
+                    changed = true;
+                    continue;
+                }
+
+                // Pattern: [->+<] (Multiply and Accumulate)
+                if (it_zero != mem_state.end() && it_zero->second == -1 && mem_state.size() > 1) {
+                    const auto pairs = sortedNonZeroPairs(mem_state);
+                    for (const auto& [offset, value] : pairs) {
+                        if (offset != 0) {
+                            optimized.push_back(Instruction{Tp::MAC, offset, value, {}});
+                        }
+                    }
+                    optimized.push_back(Instruction{Tp::SET_V, 0, 0, {}});
+                    changed = true;
+                    continue;
+                }
+
+                // Complex linear loop: solve using linear congruence
+                if (it_zero != mem_state.end() && it_zero->second != 0) {
+                    Instruction math_mac;
+                    math_mac.type = Tp::MATH_MAC;
+                    math_mac.offset = 0;
+                    math_mac.value = it_zero->second; // value change of loop counter
+
+                    const auto pairs = sortedNonZeroPairs(mem_state);
+                    for (const auto& [offset, value] : pairs) {
+                        if (offset != 0) {
+                            math_mac.sub_inst.push_back(Instruction{Tp::ADD_V, offset, value, {}});
+                        }
+                    }
+
+                    optimized.push_back(std::move(math_mac));
+                    changed = true;
+                    continue;
+                }
+            }
+
+            // Pattern: [>] or [<] (Scan for zero)
+            if (delta_p != 0 && mem_state.empty()) {
+                optimized.push_back(Instruction{Tp::SCAN, 0, delta_p, {}});
+                changed = true;
+                continue;
+            }
+
+            optimized.push_back(std::move(loop_node));
+            continue;
+        }
+
+        if (inst.type == Tp::IF_S) {
+            Instruction if_node = inst;
+            if_node.sub_inst = semanticLifting(inst.sub_inst, changed);
+            optimized.push_back(std::move(if_node));
+            continue;
+        }
+
+        optimized.push_back(inst);
+    }
+
     return optimized;
 }
 
-// std::vector<Instruction> Optimizer::semantic_lifting(const std::vector<Instruction>& block)
-// {
-//     std::vector<Instruction> optimized;
+namespace {
 
-//     for (const auto& inst : block) {
-//         if (inst.type == Tp::LOP_S) {
-//             Instruction new_loop = inst;
-//             new_loop.sub_inst = semantic_lifting(inst.sub_inst);
+// Traverse AST to conservatively collect all touched memory offsets.
+// Returns false if the block has dynamic pointer movement (e.g., SCAN or unbalanced loops).
+bool collectTouches(const std::vector<Instruction>& block, long long& current_offset, std::unordered_set<long long>& touched) {
+    for (const auto& inst : block) {
+        switch (inst.type) {
+            case Tp::MOV_P:
+                current_offset += inst.value;
+                break;
+            case Tp::ADD_V:
+            case Tp::SET_V:
+            case Tp::IN:
+            case Tp::MAC:
+                touched.insert(current_offset + inst.offset);
+                break;
+            case Tp::MATH_MAC:
+                touched.insert(current_offset); // Anchor cell becomes 0
+                for (const auto& effect : inst.sub_inst) {
+                    touched.insert(current_offset + effect.offset);
+                }
+                break;
+            case Tp::LOP_S:
+            case Tp::IF_S: {
+                long long branch_offset = current_offset;
+                if (!collectTouches(inst.sub_inst, branch_offset, touched)) {
+                    return false;
+                }
+                // If a loop/if has unmatched pointer movement, its net effect is dynamic.
+                if (branch_offset != current_offset) {
+                    return false;
+                }
+                break;
+            }
+            case Tp::SCAN:
+                return false;
+            default:
+                break;
+        }
+    }
+    return true;
+}
 
-//             bool is_complex = false;
-//             for (const auto& sub_inst : new_loop.sub_inst) {
-//                 if (sub_inst.type == Tp::IN     || sub_inst.type == Tp::OUT ||
-//                     sub_inst.type == Tp::LOP_S  || sub_inst.type == Tp::MATH_MAC) {
-//                     is_complex = true;
-//                     break;
-//                 }
-//             }
+// Internal implementation of static analysis for constant folding
+std::vector<Instruction> analyzeBlockImpl(
+    const std::vector<Instruction>& input,
+    AnalysisState& state,
+    std::unordered_set<long long>* touched_out,
+    bool& changed)
+{
+    std::vector<Instruction> output;
+    output.reserve(input.size());
 
-//             if (!is_complex) {
-//                 // ... (Since we are trying to lift *this* loop, and it has no LOP_S inside, 
-//                 // new_loop.sub_inst and inst.sub_inst are identical in structure).
-//                 long long delta_P = 0;
-//                 std::unordered_map<long long, long long> mem_state;
-                
-//                 for (const auto& sub_inst : new_loop.sub_inst) {
-//                     if (sub_inst.type == Tp::MOV_P) {
-//                         delta_P += sub_inst.value;
-//                     } else if (sub_inst.type == Tp::ADD_V) {
-//                         mem_state[sub_inst.offset + delta_P] += sub_inst.value;
-//                     } else if (sub_inst.type == Tp::SET_V) {
-//                         mem_state[sub_inst.offset + delta_P] = sub_inst.value;
-//                     } else if (sub_inst.type == Tp::MAC) {
-//                         mem_state[sub_inst.offset + delta_P] += mem_state[delta_P] * sub_inst.value;
-//                     }
-//                 }
+    auto readCell = [&](const AnalysisState& current_state, long long addr) {
+        if (!current_state.v_ptr_known) {
+            return MEMCell{ValState::UNKNOWN, 0};
+        }
+        auto it = current_state.v_mem.find(addr);
+        if (it == current_state.v_mem.end()) {
+            return MEMCell{ValState::KNOWN, 0};
+        }
+        return it->second;
+    };
 
-//                 if (delta_P == 0) {
-//                     if (mem_state.size() == 1 && mem_state.count(0) && std::abs(mem_state[0]) == 1) {
-//                         optimized.push_back(Instruction{Tp::SET_V, 0, 0, {}});
-//                         continue;
-//                     }
-//                     else if (mem_state.count(0) && mem_state[0] == -1) {
-//                         for (const auto& [off, val] : mem_state) {
-//                             if (off != 0 && val != 0) {
-//                                 optimized.push_back(Instruction{Tp::MAC, off, val, {}});
-//                             }
-//                         }
-//                         optimized.push_back(Instruction{Tp::SET_V, 0, 0, {}});
-//                         continue;
-//                     }
-//                     else if (mem_state.count(0) && mem_state[0] != 0 && std::abs(mem_state[0]) != 1) {
-//                         Instruction math_mac;
-//                         math_mac.type = Tp::MATH_MAC;
-//                         math_mac.value = mem_state[0]; 
-//                         for (const auto& [off, val] : mem_state) {
-//                             if (off != 0 && val != 0) {
-//                                 math_mac.sub_inst.push_back(Instruction{Tp::ADD_V, off, val, {}});
-//                             }
-//                         }
-//                         optimized.push_back(std::move(math_mac));
-//                         continue;
-//                     }
-//                 } else if (mem_state.empty() && delta_P != 0) {
-//                     optimized.push_back(Instruction{Tp::SCAN, 0, delta_P, {}});
-//                     continue;
-//                 }
-//             } else {
-//                 new_loop.type == Tp::LOP_S;
-//                 optimized.push_back(std::move(new_loop));
-//             }
-//         } else {
-//             optimized.push_back(inst);
-//         }
-//     }
-//     return optimized;
-// }
+    auto writeKnown = [&](AnalysisState& current_state, long long addr, long long value) {
+        if (!current_state.v_ptr_known) {
+            current_state.v_mem.clear();
+            return;
+        }
+        const unsigned char normalized = toByte(value);
+        current_state.v_mem[addr] = MEMCell{ValState::KNOWN, normalized};
+    };
 
-// std::vector<Instruction> Optimizer::static_analysis(const std::vector<Instruction>& block)
-// {
-//     // Implement Status Machine for constant folding, dead code elimination, and sandbox execution
-//     std::unordered_map<long long, MEMCell> v_mem;
-//     long long v_ptr = 0;
-
-//     auto execute_block = [&](auto& self, const std::vector<Instruction>& sub_block) -> std::vector<Instruction> {
-//         std::vector<Instruction> processed;
-//         for (const auto& inst : sub_block) {
-//             if (inst.type == Tp::MOV_P) {
-//                 v_ptr += inst.value;
-//                 processed.push_back(inst);
-//             } 
-//             else if (inst.type == Tp::SET_V) {
-//                 v_mem[v_ptr + inst.offset] = {ValState::KNOWN, static_cast<unsigned char>(inst.value)};
-//                 processed.push_back(inst);
-//             } 
-//             else if (inst.type == Tp::ADD_V) {
-//                 long long abs_pos = v_ptr + inst.offset;
-//                 if (v_mem.count(abs_pos) && v_mem[abs_pos].state == ValState::KNOWN) {
-//                     v_mem[abs_pos].value += inst.value;
-//                     // Fold into SET_V if we want, but keeping ADD_V with known state is fine for now
-//                 }
-//                 processed.push_back(inst);
-//             }
-//             else if (inst.type == Tp::IN) {
-//                 v_mem[v_ptr + inst.offset] = {ValState::UNKNOWN, 0};
-//                 processed.push_back(inst);
-//             }
-//             else if (inst.type == Tp::OUT) {
-//                 processed.push_back(inst);
-//             }
-//             else if (inst.type == Tp::MAC) {
-//                 long long src = v_ptr;
-//                 long long dst = v_ptr + inst.offset;
-//                 if (v_mem.count(src) && v_mem[src].state == ValState::KNOWN && 
-//                     v_mem.count(dst) && v_mem[dst].state == ValState::KNOWN) {
-//                     v_mem[dst].value += v_mem[src].value * inst.value;
-//                 } else {
-//                     v_mem[dst] = {ValState::UNKNOWN, 0};
-//                 }
-//                 processed.push_back(inst);
-//             }
-//             else if (inst.type == Tp::MATH_MAC) {
-//                 long long src = v_ptr;
-//                 if (v_mem.count(src) && v_mem[src].state == ValState::KNOWN) {
-//                     // Situation A: Initial value is KNOWN. We can theoretically resolve GCD/ExtGCD here.
-//                     // But for brevity of the framework, we simulate marking it corrupted or solving it.
-//                     for (const auto& eff : inst.sub_inst) {
-//                         long long dst = v_ptr + eff.offset;
-//                         v_mem[dst] = {ValState::UNKNOWN, 0};
-//                     }
-//                     v_mem[src] = {ValState::UNKNOWN, 0};
-//                     processed.push_back(inst);
-//                 } else {
-//                     // Situation B: Initial value is UNKNOWN.
-//                     for (const auto& eff : inst.sub_inst) {
-//                         long long dst = v_ptr + eff.offset;
-//                         v_mem[dst] = {ValState::UNKNOWN, 0};
-//                     }
-//                     processed.push_back(inst);
-//                 }
-//             }
-//             else if (inst.type == Tp::LOP_S) {
-//                 bool is_dead = false;
-//                 if (v_mem.count(v_ptr) && v_mem[v_ptr].state == ValState::KNOWN && v_mem[v_ptr].value == 0) {
-//                     is_dead = true;
-//                 }
-
-//                 if (is_dead) {
-//                     continue; // Skip the whole loop block
-//                 } else {
-//                     // Snapshot and dry run (simplified Sandbox implementation)
-//                     Instruction sandbox_loop = inst;
-//                     sandbox_loop.sub_inst = self(self, inst.sub_inst);
-
-//                     // We taint memory that is modified in the loop as UNKNOWN 
-//                     // because we can't fully predict loop counts without heavy symbolic execution
-//                     for (const auto& sub : sandbox_loop.sub_inst) {
-//                         if (sub.type == Tp::ADD_V || sub.type == Tp::SET_V || sub.type == Tp::IN || sub.type == Tp::MAC) {
-//                             v_mem[v_ptr + sub.offset] = {ValState::UNKNOWN, 0};
-//                         } else if (sub.type == Tp::MATH_MAC) {
-//                             for (const auto& eff : sub.sub_inst) {
-//                                 v_mem[v_ptr + eff.offset] = {ValState::UNKNOWN, 0};
-//                             }
-//                         }
-//                     }
-//                     processed.push_back(sandbox_loop);
-//                 }
-//             }
-//             else {
-//                 processed.push_back(inst);
-//             }
-//         }
-//         return processed;
-//     };
-
-//     return execute_block(execute_block, block);
-// }
+    auto writeUnknown = [&](AnalysisState& current_state, long long addr) {
+        if (!current_state.v_ptr_known) {
+            current_state.v_mem.clear();
+            return;
+        }
+        current_state.v_mem[addr] = MEMCell{ValState::UNKNOWN, 0};
+    };
 
 
-// std::vector<Instruction> Optimizer::optimize(std::vector<OPT>& instructions)
-// {
-//     size_t index = 0;
-//     std::vector<Instruction> ast = buildAST(instructions, index);
-//     std::vector<Instruction> phase1 = canonicalization(ast);
-//     std::vector<Instruction> phase2 = semantic_lifting(phase1);
-//     std::vector<Instruction> phase3 = static_analysis(phase2);
+    auto touch = [&](long long addr) {
+        if (touched_out != nullptr) {
+            touched_out->insert(addr);
+        }
+    };
 
-//     return phase3;
-// }
+    for (const auto& inst : input) {
+        switch (inst.type) {
+            case Tp::MOV_P:
+                state.v_ptr += inst.value;
+                output.push_back(inst);
+                break;
+
+            case Tp::SET_V: {
+                const long long addr = state.v_ptr + inst.offset;
+                const MEMCell before = readCell(state, addr);
+                const unsigned char normalized = toByte(inst.value);
+
+                writeKnown(state, addr, normalized);
+                touch(addr);
+
+                // Fold redundant SET_V
+                if (before.state == ValState::KNOWN && before.value == normalized) {
+                    changed = true;
+                    break;
+                }
+
+                Instruction folded = inst;
+                folded.value = normalized;
+                output.push_back(std::move(folded));
+                break;
+            }
+
+            case Tp::ADD_V: {
+                const long long addr = state.v_ptr + inst.offset;
+                const MEMCell before = readCell(state, addr);
+                touch(addr);
+
+                if (before.state == ValState::KNOWN) {
+                    // Constant folding ADD_V -> SET_V
+                    const unsigned char after = toByte(static_cast<long long>(before.value) + inst.value);
+                    writeKnown(state, addr, after);
+                    output.push_back(Instruction{Tp::SET_V, inst.offset, after, {}});
+                    changed = true;
+                } else {
+                    writeUnknown(state, addr);
+                    output.push_back(inst);
+                }
+                break;
+            }
+
+            case Tp::IN: {
+                const long long addr = state.v_ptr + inst.offset;
+                writeUnknown(state, addr);
+                touch(addr);
+                output.push_back(inst);
+                break;
+            }
+
+            case Tp::OUT:
+                output.push_back(inst);
+                break;
+
+            case Tp::MAC: {
+                const long long src_addr = state.v_ptr;
+                const long long dst_addr = state.v_ptr + inst.offset;
+                const MEMCell src = readCell(state, src_addr);
+                const MEMCell dst = readCell(state, dst_addr);
+                touch(dst_addr);
+
+                if (src.state == ValState::KNOWN && src.value == 0) {
+                    // src is 0, MAC does nothing
+                    changed = true;
+                    break;
+                }
+
+                if (src.state == ValState::KNOWN && dst.state == ValState::KNOWN) {
+                    // Constant folding MAC -> SET_V
+                    const unsigned char after = toByte(static_cast<long long>(dst.value) + static_cast<long long>(src.value) * inst.value);
+                    writeKnown(state, dst_addr, after);
+                    output.push_back(Instruction{Tp::SET_V, inst.offset, after, {}});
+                    changed = true;
+                } else {
+                    writeUnknown(state, dst_addr);
+                    output.push_back(inst);
+                }
+                break;
+            }
+
+            case Tp::MATH_MAC: {
+                const long long src_addr = state.v_ptr;
+                const MEMCell src = readCell(state, src_addr);
+
+                if (src.state == ValState::KNOWN) {
+                    const long long src_value = src.value;
+                    if (src_value == 0) {
+                        changed = true;
+                        break;
+                    }
+
+                    long long k = 0;
+                    long long period = 0;
+                    // Solve for number of iterations k
+                    const bool solvable = MathSolver::solveLinearCongruence(inst.value, -src_value, kTapeMod, k, period);
+                    if (!solvable) {
+                        output.push_back(Instruction{Tp::TRAP, 0, 0, {}});
+                        changed = true;
+                        break;
+                    }
+
+                    if (k == 0) k = period;
+
+                    // Apply effects for k iterations
+                    for (const auto& effect : inst.sub_inst) {
+                        const long long addr = state.v_ptr + effect.offset;
+                        const long long delta = effect.value * k;
+                        const MEMCell before = readCell(state, addr);
+                        touch(addr);
+
+                        if (before.state == ValState::KNOWN) {
+                            const unsigned char after = toByte(static_cast<long long>(before.value) + delta);
+                            writeKnown(state, addr, after);
+                            output.push_back(Instruction{Tp::SET_V, effect.offset, after, {}});
+                        } else {
+                            writeUnknown(state, addr);
+                            output.push_back(Instruction{Tp::ADD_V, effect.offset, delta, {}});
+                        }
+                    }
+
+                    writeKnown(state, src_addr, 0);
+                    touch(src_addr);
+                    output.push_back(Instruction{Tp::SET_V, 0, 0, {}});
+                    changed = true;
+                } else {
+                    // Source unknown, but loop ends when cell is 0
+                    writeKnown(state, src_addr, 0);
+                    touch(src_addr);
+                    for (const auto& effect : inst.sub_inst) {
+                        writeUnknown(state, state.v_ptr + effect.offset);
+                        touch(state.v_ptr + effect.offset);
+                    }
+                    output.push_back(inst);
+                }
+                break;
+            }
+
+            case Tp::SCAN: {
+                const MEMCell anchor = readCell(state, state.v_ptr);
+                if (anchor.state == ValState::KNOWN && anchor.value == 0) {
+                    changed = true;
+                    break;
+                }
+                output.push_back(inst);
+                // SCAN makes pointer and memory state unknown
+                state.v_mem.clear();
+                state.v_ptr_known = false;
+                break;
+            }
+
+            case Tp::LOP_S: {
+                const long long anchor_addr = state.v_ptr;
+                const MEMCell anchor = readCell(state, anchor_addr);
+                if (anchor.state == ValState::KNOWN && anchor.value == 0) {
+                    changed = true;
+                    break;
+                }
+
+                // Identify all cells touched by the loop
+                std::unordered_set<long long> touched_inside;
+                long long dummy_offset = 0;
+                bool predictable_movement = collectTouches(inst.sub_inst, dummy_offset, touched_inside);
+
+                // Analyze with touched cells marked as UNKNOWN
+                const AnalysisState snapshot = state;
+                AnalysisState sandbox = state;
+
+                if (!predictable_movement) {
+                    sandbox.v_mem.clear();
+                    sandbox.v_ptr_known = false;
+                } else {
+                    for (long long rel_addr : touched_inside) {
+                        writeUnknown(sandbox, state.v_ptr + rel_addr);
+                    }
+                }
+
+                std::vector<Instruction> analyzed_body = analyzeBlockImpl(inst.sub_inst, sandbox, nullptr, changed);
+
+                const MEMCell anchor_after = readCell(sandbox, anchor_addr);
+
+                // Pointer is known and returns to the same position, anchor cell becomes 0, and no unknown cells are introduced.
+                const bool single_iteration = (sandbox.v_ptr_known && snapshot.v_ptr_known &&
+                                               sandbox.v_ptr == snapshot.v_ptr &&
+                                               anchor_after.state == ValState::KNOWN &&
+                                               anchor_after.value == 0);
+
+                if (single_iteration) {
+                    Instruction if_node;
+                    if_node.type = Tp::IF_S;
+                    if_node.offset = 0;
+                    if_node.value = 0;
+                    if_node.sub_inst = std::move(analyzed_body);
+                    output.push_back(std::move(if_node));
+                    changed = true;
+                } else {
+                    Instruction loop_node = inst;
+                    loop_node.sub_inst = std::move(analyzed_body);
+                    output.push_back(std::move(loop_node));
+                }
+
+                // Update state after loop
+                state = snapshot;
+                if (!predictable_movement) {
+                    state.v_mem.clear();
+                    state.v_ptr_known = false;
+                } else {
+                    for (long long rel_addr : touched_inside) {
+                        writeUnknown(state, state.v_ptr + rel_addr);
+                    }
+                    if (sandbox.v_ptr != snapshot.v_ptr) {
+                        state.v_ptr_known = false;
+                    }
+                    if (state.v_ptr_known) {
+                        writeKnown(state, anchor_addr, 0);
+                    }
+                }
+                break;
+            }
+
+            case Tp::IF_S: {
+                const AnalysisState snapshot = state;
+                AnalysisState branch_state = state;
+                std::unordered_set<long long> touched_inside;
+                long long dummy_offset = 0;
+                bool predictable_movement = collectTouches(inst.sub_inst, dummy_offset, touched_inside);
+
+                if (!predictable_movement) {
+                    branch_state.v_mem.clear();
+                    branch_state.v_ptr_known = false;
+                } else {
+                    for (long long rel_addr : touched_inside) {
+                        writeUnknown(branch_state, state.v_ptr + rel_addr);
+                    }
+                }
+
+                Instruction if_node = inst;
+                if_node.sub_inst = analyzeBlockImpl(inst.sub_inst, branch_state, nullptr, changed);
+
+                if (if_node.sub_inst.empty()) {
+                    changed = true;
+                } else {
+                    output.push_back(std::move(if_node));
+                }
+
+                state = snapshot;
+                if (!predictable_movement) {
+                    state.v_mem.clear();
+                    state.v_ptr_known = false;
+                } else {
+                    for (long long rel_addr : touched_inside) {
+                        writeUnknown(state, state.v_ptr + rel_addr);
+                    }
+                    if (branch_state.v_ptr != snapshot.v_ptr) {
+                        state.v_ptr_known = false;
+                    }
+                }
+                break;
+            }
+
+            default:
+                output.push_back(inst);
+                break;
+        }
+    }
+
+    return output;
+}
+} // namespace
+
+// Static Analysis pass for constant folding and redundancy removal
+std::vector<Instruction> Optimizer::staticAnalysis(const std::vector<Instruction>& block, bool& changed)
+{
+    AnalysisState root_state;
+    return analyzeBlockImpl(block, root_state, nullptr, changed);
+}
+
+std::vector<Instruction> Optimizer::eliminateRedundantWrites(const std::vector<Instruction>& block, bool& changed)
+{
+    std::vector<Instruction> output;
+    output.reserve(block.size());
+
+    std::vector<bool> keep;
+    keep.reserve(block.size());
+
+    std::unordered_map<long long, size_t> last_write;
+    bool ptr_known = true;
+    long long ptr = 0;
+
+    auto invalidate_addr = [&](long long addr) {
+        last_write.erase(addr);
+    };
+
+    auto clear_tracking = [&]() {
+        last_write.clear();
+    };
+
+    for (const auto& inst : block) {
+        if (inst.type == Tp::MOV_P) {
+            if (ptr_known) {
+                ptr += inst.value;
+            }
+            output.push_back(inst);
+            keep.push_back(true);
+            continue;
+        }
+
+        if (inst.type == Tp::LOP_S || inst.type == Tp::IF_S) {
+            bool sub_changed = false;
+            Instruction node = inst;
+            node.sub_inst = eliminateRedundantWrites(inst.sub_inst, sub_changed);
+            changed = changed || sub_changed;
+
+            output.push_back(std::move(node));
+            keep.push_back(true);
+
+            clear_tracking();
+            ptr_known = false;
+            continue;
+        }
+
+        if (inst.type == Tp::SCAN) {
+            output.push_back(inst);
+            keep.push_back(true);
+            clear_tracking();
+            ptr_known = false;
+            continue;
+        }
+
+        if (!ptr_known) {
+            output.push_back(inst);
+            keep.push_back(true);
+            continue;
+        }
+
+        const long long addr = ptr + inst.offset;
+
+        switch (inst.type) {
+            case Tp::SET_V:
+            case Tp::IN: {
+                // I/O operations must be preserved.
+                auto it = last_write.find(addr);
+                if (it != last_write.end()) {
+                    keep[it->second] = false;
+                    changed = true;
+                }
+                output.push_back(inst);
+                keep.push_back(true);
+                invalidate_addr(addr); 
+                break;
+            }
+
+            case Tp::ADD_V: {
+                invalidate_addr(addr); // read of old value
+                output.push_back(inst);
+                keep.push_back(true);
+                last_write[addr] = output.size() - 1;
+                break;
+            }
+
+            case Tp::OUT: {
+                invalidate_addr(addr); // read
+                output.push_back(inst);
+                keep.push_back(true);
+                break;
+            }
+
+            case Tp::MAC: {
+                const long long src_addr = ptr;
+                const long long dst_addr = ptr + inst.offset;
+                invalidate_addr(src_addr); // read
+                invalidate_addr(dst_addr); // read-modify-write
+
+                output.push_back(inst);
+                keep.push_back(true);
+                last_write[dst_addr] = output.size() - 1;
+                break;
+            }
+
+            case Tp::MATH_MAC: {
+                output.push_back(inst);
+                keep.push_back(true);
+                clear_tracking();
+                break;
+            }
+
+            default:
+                output.push_back(inst);
+                keep.push_back(true);
+                clear_tracking();
+                break;
+        }
+    }
+
+    std::vector<Instruction> compact;
+    compact.reserve(output.size());
+    for (size_t i = 0; i < output.size(); ++i) {
+        if (keep[i]) {
+            compact.push_back(std::move(output[i]));
+        }
+    }
+
+    if (!blockEqual(compact, block)) {
+        changed = true;
+    }
+
+    return compact;
+}
+
+// Main optimization loop: iterate until fixed point or max iterations reached
+std::vector<Instruction> Optimizer::optimize(const std::vector<Operation>& instructions)
+{
+    size_t index = 0;
+    std::vector<Instruction> ir = buildAst(instructions, index);
+
+    bool changed = true;
+    int iteration = 0;
+    constexpr int k_max_iterations = 32;
+
+    while (changed && iteration < k_max_iterations) {
+        changed = false;
+
+        bool pass_changed = false;
+        ir = canonicalization(ir, pass_changed);
+        changed = changed || pass_changed;
+
+        pass_changed = false;
+        ir = semanticLifting(ir, pass_changed);
+        changed = changed || pass_changed;
+
+        pass_changed = false;
+        ir = staticAnalysis(ir, pass_changed);
+        changed = changed || pass_changed;
+
+        pass_changed = false;
+        ir = eliminateRedundantWrites(ir, pass_changed);
+        changed = changed || pass_changed;
+
+        ++iteration;
+    }
+
+    if (iteration >= k_max_iterations) {
+        std::cerr << "Warning: Optimization did not converge after "
+                  << k_max_iterations << " iterations." << std::endl;
+    }
+
+    return ir;
+}
