@@ -1,5 +1,8 @@
 *.exe
-Temp/*
+Temp
 *.py
-.vscode/*
+.vscode
 bf-compiler/*
+*.zip
+*.bat
+.venv
